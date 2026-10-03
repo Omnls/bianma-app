@@ -7,6 +7,7 @@ use crate::provider::Provider;
 use crate::proxy::{
     extract_session_id,
     forwarder::RequestForwarder,
+    provider_binding::{AdmissionState, RequestFacts, SelectionFacts},
     server::ProxyState,
     types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
     ProxyError,
@@ -41,6 +42,11 @@ pub struct RequestContext {
     pub provider: Provider,
     /// 完整的 Provider 列表（用于故障转移）
     providers: Vec<Provider>,
+    /// 同一次选择采集的有序绑定事实（含未被旧语义 admitted 的候选；不含任何 Secret）
+    ///
+    /// 请求期仅由 create_forwarder 的诊断日志消费安全标量（不含任何标识或原文）；
+    /// 持久化真实绑定、代际检查与完整有序比较由后续切片消费。
+    selection_facts: SelectionFacts,
     /// 请求开始时的"当前供应商"（用于判断是否需要同步 UI/托盘）
     ///
     /// 这里使用本地 settings 的设备级 current provider。
@@ -123,10 +129,17 @@ impl RequestContext {
         );
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
+        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额；
+        // 绑定事实在同一次配置/队列/熔断读取内采集，不引入额外 DB 或熔断器访问。
+        // 事实解析永不失败（无法静态证明时落入封闭的 Incomparable），
+        // 因此不会影响原本可发送的请求。
+        let request_facts = RequestFacts {
+            model: &request_model,
+            thinking_enabled: crate::proxy::model_mapper::has_thinking_enabled(body),
+        };
+        let selection = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_providers_with_facts(app_type_str, &request_facts)
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
@@ -135,6 +148,8 @@ impl RequestContext {
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
+        let providers = selection.providers;
+        let selection_facts = selection.facts;
 
         let provider = providers
             .first()
@@ -155,6 +170,7 @@ impl RequestContext {
             app_config,
             provider,
             providers,
+            selection_facts,
             current_provider_id,
             request_model,
             tag,
@@ -213,6 +229,26 @@ impl RequestContext {
                 (0, 0, 0)
             };
 
+        // 选择事实的只读诊断消费：仅记录总候选数、admitted 数与整次可比较性
+        // 这三个安全标量（及静态 tag），用于确认事实采集在当前请求可用；
+        // 不输出 provider 标识、URL、模型、reason detail 或任何请求内容，
+        // 不修改响应/错误/发送行为；debug 未启用时不遍历事实。
+        if log::log_enabled!(log::Level::Debug) {
+            let facts = self.selection_facts();
+            let admitted = facts
+                .candidates
+                .iter()
+                .filter(|c| c.admission == AdmissionState::Admitted)
+                .count();
+            log::debug!(
+                "[{}] Selection facts: candidates={}, admitted={}, comparable={}",
+                self.tag,
+                facts.candidates.len(),
+                admitted,
+                facts.selection_incomparable.is_none()
+            );
+        }
+
         RequestForwarder::new(
             state.provider_router.clone(),
             non_streaming_timeout,
@@ -234,6 +270,13 @@ impl RequestContext {
     /// 返回在创建上下文时已选择的 providers，避免重复调用 select_providers()
     pub fn get_providers(&self) -> Vec<Provider> {
         self.providers.clone()
+    }
+
+    /// 获取本次选择采集的绑定事实（不含 Secret，不触发任何额外 IO）
+    ///
+    /// 当前由 create_forwarder 的诊断日志消费安全标量；持久化/影子比较由后续切片消费。
+    pub fn selection_facts(&self) -> &SelectionFacts {
+        &self.selection_facts
     }
 
     /// 计算请求延迟（毫秒）
