@@ -2,6 +2,10 @@
 //!
 //! 负责选择和管理代理目标供应商，实现智能故障转移
 
+use super::provider_binding::{
+    capture_candidate, capture_missing_candidate, AdmissionState, CurrentProviderSource,
+    RequestFacts, SelectWithFacts, SelectionFacts, SelectionMode,
+};
 use crate::app_config::AppType;
 use crate::database::Database;
 use crate::error::AppError;
@@ -34,7 +38,38 @@ impl ProviderRouter {
     /// 返回按优先级排序的可用供应商列表：
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
+    ///
+    /// 生产路径已由 `select_providers_with_facts` 取代；本入口仅保留给
+    /// 新旧选择语义差分测试与既有单元测试使用。
+    #[cfg(test)]
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+        let (providers, _) = self.select_inner(app_type, None).await?;
+        Ok(providers)
+    }
+
+    /// 选择供应商，并在同一次配置/队列/熔断读取内采集有序绑定事实
+    ///
+    /// 与 `select_providers` 共享同一条选择路径（`select_inner`），返回的
+    /// providers 与旧语义完全一致；facts 覆盖全量配置候选（含被熔断拒绝与
+    /// 缺失跳过的候选），仅供后续“配置发布时持久化真实绑定 / 代际检查 /
+    /// 完整有序比较”切片消费，不影响任何发送行为、错误语义或重试逻辑。
+    pub async fn select_providers_with_facts(
+        &self,
+        app_type: &str,
+        request: &RequestFacts<'_>,
+    ) -> Result<SelectWithFacts, AppError> {
+        let (providers, facts) = self.select_inner(app_type, Some(request)).await?;
+        let facts = facts.expect("request 提供时必须采集 facts");
+        Ok(SelectWithFacts { providers, facts })
+    }
+
+    /// 选择主流程：request 为 None 时与旧 `select_providers` 行为逐字节一致，
+    /// 为 Some 时在相同读取点同步采集事实（不引入额外 DB/熔断器访问）
+    async fn select_inner(
+        &self,
+        app_type: &str,
+        request: Option<&RequestFacts<'_>>,
+    ) -> Result<(Vec<Provider>, Option<SelectionFacts>), AppError> {
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
@@ -47,6 +82,17 @@ impl ProviderRouter {
                 false
             }
         };
+
+        let mut facts = request.map(|_| {
+            SelectionFacts::new(
+                app_type,
+                if auto_failover_enabled {
+                    SelectionMode::FailoverEnabled
+                } else {
+                    SelectionMode::FailoverDisabled
+                },
+            )
+        });
 
         if auto_failover_enabled {
             // 故障转移开启：仅按队列顺序依次尝试（P1 → P2 → ...）
@@ -62,35 +108,76 @@ impl ProviderRouter {
 
             total_providers = ordered_ids.len();
 
-            for provider_id in ordered_ids {
+            for (ordinal, provider_id) in ordered_ids.into_iter().enumerate() {
                 let Some(provider) = all_providers.get(&provider_id).cloned() else {
+                    // 旧语义：静默跳过缺失 provider；事实中保留占位，便于后续对账
+                    if let Some(f) = facts.as_mut() {
+                        f.candidates
+                            .push(capture_missing_candidate(ordinal, &provider_id));
+                    }
                     continue;
                 };
 
                 let circuit_key = format!("{app_type}:{}", provider.id);
                 let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
 
-                if breaker.is_available().await {
-                    result.push(provider);
+                let available = breaker.is_available().await;
+                if available {
+                    result.push(provider.clone());
                 } else {
                     circuit_open_count += 1;
+                }
+
+                if let (Some(f), Some(req)) = (facts.as_mut(), request) {
+                    f.candidates.push(capture_candidate(
+                        ordinal,
+                        &provider,
+                        if available {
+                            AdmissionState::Admitted
+                        } else {
+                            AdmissionState::RejectedCircuitOpen
+                        },
+                        true,
+                        app_type,
+                        req,
+                    ));
                 }
             }
         } else {
             // 故障转移关闭：仅使用当前供应商，跳过熔断器检查
-            let current_id = AppType::from_str(app_type)
-                .ok()
-                .and_then(|app_enum| {
-                    crate::settings::get_effective_current_provider(&self.db, &app_enum)
-                        .ok()
-                        .flatten()
-                })
-                .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
+            let effective_current = AppType::from_str(app_type).ok().and_then(|app_enum| {
+                crate::settings::get_effective_current_provider(&self.db, &app_enum)
+                    .ok()
+                    .flatten()
+            });
+
+            let (current_id, current_source) = if let Some(id) = effective_current {
+                (Some(id), Some(CurrentProviderSource::EffectiveCurrent))
+            } else {
+                match self.db.get_current_provider(app_type).ok().flatten() {
+                    Some(id) => (Some(id), Some(CurrentProviderSource::DatabaseCurrent)),
+                    None => (None, None),
+                }
+            };
+
+            if let Some(f) = facts.as_mut() {
+                f.current_provider_source = current_source;
+            }
 
             if let Some(current_id) = current_id {
                 if let Some(current) = self.db.get_provider_by_id(&current_id, app_type)? {
                     total_providers = 1;
-                    result.push(current);
+                    result.push(current.clone());
+                    if let (Some(f), Some(req)) = (facts.as_mut(), request) {
+                        f.candidates.push(capture_candidate(
+                            0,
+                            &current,
+                            AdmissionState::Admitted,
+                            false,
+                            app_type,
+                            req,
+                        ));
+                    }
                 }
             }
         }
@@ -105,7 +192,11 @@ impl ProviderRouter {
             }
         }
 
-        Ok(result)
+        if let Some(f) = facts.as_mut() {
+            f.mark_capacity();
+        }
+
+        Ok((result, facts))
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -386,6 +477,115 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_select_providers_with_facts_matches_legacy_and_captures_all() {
+        use crate::proxy::provider_binding::{AdmissionState, BindingFact, RequestFacts};
+
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let provider_a = Provider::with_id(
+            "a".to_string(),
+            "Provider A".to_string(),
+            json!({"env": {"ANTHROPIC_BASE_URL": "https://a-fake.example.test"}}),
+            None,
+        );
+        let provider_b = Provider::with_id(
+            "b".to_string(),
+            "Provider B".to_string(),
+            json!({"env": {"ANTHROPIC_BASE_URL": "https://b-fake.example.test"}}),
+            None,
+        );
+
+        db.save_provider("claude", &provider_a).unwrap();
+        db.save_provider("claude", &provider_b).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+        db.add_to_failover_queue("claude", "b").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+
+        // 旧入口与新入口返回的 providers 必须完全一致
+        let legacy = router.select_providers("claude").await.unwrap();
+        let request = RequestFacts {
+            model: "claude-sonnet-4-5-fake",
+            thinking_enabled: false,
+        };
+        let outcome = router
+            .select_providers_with_facts("claude", &request)
+            .await
+            .unwrap();
+
+        let legacy_ids: Vec<&str> = legacy.iter().map(|p| p.id.as_str()).collect();
+        let new_ids: Vec<&str> = outcome.providers.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(legacy_ids, new_ids);
+
+        // 事实覆盖全量配置候选，且 admitted 状态与旧语义一致
+        assert_eq!(outcome.facts.candidates.len(), 2);
+        assert!(outcome
+            .facts
+            .candidates
+            .iter()
+            .all(|c| c.admission == AdmissionState::Admitted));
+        assert!(outcome.facts.selection_incomparable.is_none());
+
+        // 静态 Claude 候选可解析出真实 base URL
+        match &outcome.facts.candidates[0].binding {
+            BindingFact::Resolved(resolved) => {
+                assert_eq!(resolved.endpoint.base_url, "https://a-fake.example.test");
+            }
+            other => panic!("expected resolved binding, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_select_providers_with_facts_marks_candidate_overflow() {
+        use crate::proxy::provider_binding::{IncomparableReason, RequestFacts};
+
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        for i in 0..17usize {
+            let id = format!("p{i:02}");
+            let provider = Provider::with_id(
+                id.clone(),
+                format!("Provider {i}"),
+                json!({"env": {"ANTHROPIC_BASE_URL": format!("https://fake-{i}.example.test")}}),
+                None,
+            );
+            db.save_provider("claude", &provider).unwrap();
+            db.add_to_failover_queue("claude", &id).unwrap();
+        }
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let request = RequestFacts {
+            model: "claude-sonnet-4-5-fake",
+            thinking_enabled: false,
+        };
+        let outcome = router
+            .select_providers_with_facts("claude", &request)
+            .await
+            .unwrap();
+
+        // 17 个候选：providers 发送列表不受事实层容量规则影响，
+        // 但整次比较被封闭标记为容量不可比
+        assert_eq!(outcome.providers.len(), 17);
+        assert_eq!(outcome.facts.candidates.len(), 17);
+        assert_eq!(
+            outcome.facts.selection_incomparable,
+            Some(IncomparableReason::CandidateOverflow { count: 17, max: 16 })
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_failover_enabled_uses_queue_only_even_if_current_not_in_queue() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
@@ -508,5 +708,174 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_open_candidate_excluded_from_providers_but_preserved_in_facts() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        let provider_b =
+            Provider::with_id("b".to_string(), "Provider B".to_string(), json!({}), None);
+
+        db.save_provider("claude", &provider_a).unwrap();
+        db.save_provider("claude", &provider_b).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+        db.add_to_failover_queue("claude", "b").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        router
+            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        let request = RequestFacts {
+            model: "claude-sonnet-4-5-fake",
+            thinking_enabled: false,
+        };
+        let outcome = router
+            .select_providers_with_facts("claude", &request)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.providers.len(), 1);
+        assert_eq!(outcome.providers[0].id, "b");
+
+        assert_eq!(outcome.facts.candidates.len(), 2);
+        assert_eq!(outcome.facts.candidates[0].provider_id, "a");
+        assert_eq!(
+            outcome.facts.candidates[0].admission,
+            AdmissionState::RejectedCircuitOpen
+        );
+        assert!(outcome.facts.candidates[0].breaker_checked);
+        assert_eq!(outcome.facts.candidates[1].provider_id, "b");
+        assert_eq!(
+            outcome.facts.candidates[1].admission,
+            AdmissionState::Admitted
+        );
+        assert!(outcome.facts.candidates[1].breaker_checked);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_half_open_permit_not_consumed_by_select_but_limited_by_allow() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider_a).unwrap();
+        db.add_to_failover_queue("claude", "a").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        router
+            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        let request = RequestFacts {
+            model: "claude-sonnet-4-5-fake",
+            thinking_enabled: false,
+        };
+        let outcome = router
+            .select_providers_with_facts("claude", &request)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.providers.len(), 1);
+        assert_eq!(outcome.providers[0].id, "a");
+        assert_eq!(outcome.facts.candidates.len(), 1);
+        assert_eq!(
+            outcome.facts.candidates[0].admission,
+            AdmissionState::Admitted
+        );
+        assert!(outcome.facts.candidates[0].breaker_checked);
+
+        let first = router.allow_provider_request("a", "claude").await;
+        assert!(first.allowed);
+        assert!(first.used_half_open_permit);
+
+        let second = router.allow_provider_request("a", "claude").await;
+        assert!(!second.allowed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_failover_disabled_keeps_open_current_provider_and_facts() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        db.save_provider("claude", &provider_a).unwrap();
+        db.set_current_provider("claude", "a").unwrap();
+
+        let mut config = db.get_proxy_config_for_app("claude").await.unwrap();
+        config.auto_failover_enabled = false;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        db.update_circuit_breaker_config(&CircuitBreakerConfig {
+            failure_threshold: 1,
+            timeout_seconds: 60,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        router
+            .record_result("a", "claude", false, false, Some("fail".to_string()))
+            .await
+            .unwrap();
+
+        let request = RequestFacts {
+            model: "claude-sonnet-4-5-fake",
+            thinking_enabled: false,
+        };
+        let outcome = router
+            .select_providers_with_facts("claude", &request)
+            .await
+            .unwrap();
+
+        let legacy = router.select_providers("claude").await.unwrap();
+        assert_eq!(legacy.len(), 1);
+        assert_eq!(legacy[0].id, "a");
+        assert_eq!(outcome.providers.len(), 1);
+        assert_eq!(outcome.providers[0].id, "a");
+
+        assert_eq!(outcome.facts.candidates.len(), 1);
+        assert_eq!(outcome.facts.candidates[0].provider_id, "a");
+        assert_eq!(
+            outcome.facts.candidates[0].admission,
+            AdmissionState::Admitted
+        );
+        assert!(!outcome.facts.candidates[0].breaker_checked);
     }
 }
